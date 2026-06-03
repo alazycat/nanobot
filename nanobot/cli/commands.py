@@ -5,7 +5,6 @@ import os
 import select
 import signal
 import sys
-import time
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
 from pathlib import Path
@@ -622,12 +621,11 @@ def _run_gateway(
     open_browser_url: str | None = None,
 ) -> None:
     """Shared gateway runtime; ``open_browser_url`` opens a tab once channels are up."""
-    from nanobot.agent.tools.cron import CronTool
     from nanobot.agent.tools.message import MessageTool
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
+    from nanobot.cron.executor import CronJobExecutor
     from nanobot.cron.service import CronService
-    from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
     from nanobot.providers.factory import build_provider_snapshot, load_provider_snapshot
     from nanobot.session.manager import SessionManager
@@ -714,154 +712,19 @@ def _run_gateway(
     if isinstance(message_tool, MessageTool):
         message_tool.set_send_callback(_deliver_to_channel)
 
-    # Set cron callback (needs agent)
-    async def on_cron_job(job: CronJob) -> str | None:
-        """Execute a cron job through the agent."""
-        # Dream is an internal job — run directly, not through the agent loop.
-        if job.name == "dream":
-            try:
-                await agent.dream.run()
-                logger.info("Dream cron job completed")
-            except Exception:
-                logger.exception("Dream cron job failed")
+    def _get_channel(channel_name: str) -> Any | None:
+        try:
+            return channels.channels.get(channel_name)
+        except NameError:
             return None
 
-        from nanobot.utils.evaluator import evaluate_response
-
-        reminder_note = (
-            "The scheduled time has arrived. Deliver this reminder to the user now, "
-            "as a brief and natural message in their language. Speak directly to them — "
-            "do not narrate progress, summarize, include user IDs, or add status reports "
-            "like 'Done' or 'Reminded'.\n\n"
-            f"Reminder: {job.payload.message}"
-        )
-
-        cron_tool = agent.tools.get("cron")
-        cron_token = None
-        if isinstance(cron_tool, CronTool):
-            cron_token = cron_tool.set_cron_context(True)
-
-        async def _silent(*_args, **_kwargs):
-            pass
-
-        message_record_token = None
-        if isinstance(message_tool, MessageTool):
-            message_record_token = message_tool.set_record_channel_delivery(True)
-
-        channel_name = job.payload.channel or "cli"
-        chat_id = job.payload.to or "direct"
-        try:
-            target_channel = channels.channels.get(channel_name)
-        except NameError:
-            target_channel = None
-        wants_stream = bool(
-            job.payload.deliver
-            and job.payload.to
-            and target_channel is not None
-            and target_channel.supports_streaming
-        )
-
-        stream_base_id = None
-        stream_segment = 0
-        stream_had_delta = False
-        stream_events: list[OutboundMessage] = []
-
-        def _current_stream_id() -> str:
-            return f"{stream_base_id}:{stream_segment}"
-
-        async def _on_stream(delta: str) -> None:
-            nonlocal stream_had_delta
-            meta = dict(job.payload.channel_meta)
-            meta["_stream_delta"] = True
-            meta["_stream_id"] = _current_stream_id()
-            stream_events.append(OutboundMessage(
-                channel=channel_name,
-                chat_id=chat_id,
-                content=delta,
-                metadata=meta,
-            ))
-            if delta:
-                stream_had_delta = True
-
-        async def _on_stream_end(*, resuming: bool = False) -> None:
-            nonlocal stream_segment
-            meta = dict(job.payload.channel_meta)
-            meta["_stream_end"] = True
-            meta["_resuming"] = resuming
-            meta["_stream_id"] = _current_stream_id()
-            stream_events.append(OutboundMessage(
-                channel=channel_name,
-                chat_id=chat_id,
-                content="",
-                metadata=meta,
-            ))
-            stream_segment += 1
-
-        if wants_stream:
-            stream_base_id = f"cron:{job.id}:{time.time_ns()}"
-
-        async def _publish_buffered_stream() -> None:
-            for event in stream_events:
-                await bus.publish_outbound(event)
-
-        async def _publish_turn_end_if_needed() -> None:
-            if channel_name != "websocket" or not job.payload.to:
-                return
-            await bus.publish_outbound(OutboundMessage(
-                channel=channel_name,
-                chat_id=chat_id,
-                content="",
-                metadata={**job.payload.channel_meta, "_turn_end": True},
-            ))
-
-        try:
-            resp = await agent.process_direct(
-                reminder_note,
-                session_key=f"cron:{job.id}",
-                channel=channel_name,
-                chat_id=chat_id,
-                on_progress=_silent,
-                on_stream=_on_stream if wants_stream else None,
-                on_stream_end=_on_stream_end if wants_stream else None,
-            )
-        finally:
-            if isinstance(cron_tool, CronTool) and cron_token is not None:
-                cron_tool.reset_cron_context(cron_token)
-            if isinstance(message_tool, MessageTool) and message_record_token is not None:
-                message_tool.reset_record_channel_delivery(message_record_token)
-
-        response = resp.content if resp else ""
-
-        if job.payload.deliver and isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
-            await _publish_turn_end_if_needed()
-            return response
-
-        delivered = False
-        if job.payload.deliver and job.payload.to and response:
-            should_notify = await evaluate_response(
-                response, reminder_note, agent.provider, agent.model,
-            )
-            if should_notify:
-                meta = dict(job.payload.channel_meta)
-                if wants_stream and stream_had_delta:
-                    await _publish_buffered_stream()
-                    meta["_streamed"] = True
-                await _deliver_to_channel(
-                    OutboundMessage(
-                        channel=channel_name,
-                        chat_id=chat_id,
-                        content=response,
-                        metadata=meta,
-                    ),
-                    record=True,
-                    session_key=job.payload.session_key,
-                )
-                delivered = True
-        if delivered:
-            await _publish_turn_end_if_needed()
-        return response
-
-    cron.on_job = on_cron_job
+    cron_executor = CronJobExecutor(
+        agent=agent,
+        bus=bus,
+        deliver_to_channel=_deliver_to_channel,
+        get_channel=_get_channel,
+    )
+    cron.on_job = cron_executor.run
 
     # Create channel manager (forwards SessionManager so the WebSocket channel
     # can serve the embedded webui's REST surface).
