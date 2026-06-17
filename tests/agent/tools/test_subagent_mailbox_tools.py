@@ -65,6 +65,30 @@ async def test_wait_subagents_returns_result_once(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_subagents_reads_result_after_manager_recreation(tmp_path: Path) -> None:
+    mgr = _manager(tmp_path)
+    mgr.runner.run = AsyncMock(
+        return_value=AgentRunResult(final_content="durable worker result", messages=[], stop_reason="completed")
+    )
+
+    await mgr.spawn("do durable work", label="worker", session_key="cli:test")
+    task_id = next(iter(mgr._running_tasks))
+    await _drain(mgr)
+
+    recreated = _manager(tmp_path)
+    wait_tool = WaitSubagentsTool(recreated)
+    poll_tool = PollSubagentsTool(recreated)
+    _bind(wait_tool)
+    _bind(poll_tool)
+
+    first = await wait_tool.execute(task_id=task_id, timeout_seconds=0)
+    after = await poll_tool.execute(task_id=task_id)
+
+    assert "durable worker result" in first
+    assert "result consumed" in after
+
+
+@pytest.mark.asyncio
 async def test_poll_subagents_reports_running_completed_and_not_found(tmp_path: Path) -> None:
     mgr = _manager(tmp_path)
     release = asyncio.Event()

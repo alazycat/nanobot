@@ -25,6 +25,10 @@ from nanobot.agent.memory import Consolidator
 from nanobot.agent.progress_hook import AgentProgressHook
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.subagent_delivery import (
+    build_subagent_result_continuation,
+    materialize_subagent_result_continuation,
+)
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.file_state import FileStateStore, bind_file_states, reset_file_states
 from nanobot.agent.tools.message import MessageTool
@@ -287,6 +291,7 @@ class AgentLoop:
             max_iterations=self.max_iterations,
             max_concurrent_subagents=max_concurrent_subagents,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
+            on_result_ready=self._on_subagent_result_ready,
         )
         self._unified_session = unified_session
         self._max_messages = max_messages if max_messages > 0 else 120
@@ -548,6 +553,21 @@ class AgentLoop:
         """Build a progress callback that publishes to the message bus."""
         return build_bus_progress_callback(self.bus, msg)
 
+    async def _on_subagent_result_ready(self, result: Any) -> None:
+        """Wake the owning session when a subagent result becomes ready."""
+        msg = build_subagent_result_continuation(result)
+        queue = self._pending_queues.get(result.session_key)
+        if queue is not None:
+            try:
+                queue.put_nowait(msg)
+                return
+            except asyncio.QueueFull:
+                logger.warning(
+                    "Pending queue full for subagent result in session {}; queueing fresh turn",
+                    result.session_key,
+                )
+        await self.bus.publish_inbound(msg)
+
     async def _build_retry_wait_callback(
         self, msg: InboundMessage
     ) -> Callable[[str], Awaitable[None]]:
@@ -750,9 +770,15 @@ class AgentLoop:
             items: list[dict[str, Any]] = []
             while len(items) < limit:
                 try:
-                    items.append(_to_user_message(pending_queue.get_nowait()))
+                    pending_msg = pending_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+                pending_msg = await materialize_subagent_result_continuation(
+                    pending_msg,
+                    session_key=active_session_key or pending_msg.session_key,
+                    subagents=self.subagents,
+                )
+                items.append(_to_user_message(pending_msg))
 
             return items
 
@@ -1409,6 +1435,11 @@ class AgentLoop:
                 ctx.session,
                 replay_max_messages=self._max_messages,
             )
+        ctx.msg = await materialize_subagent_result_continuation(
+            ctx.msg,
+            session_key=ctx.session_key,
+            subagents=self.subagents,
+        )
         self._set_tool_context(
             ctx.msg.channel,
             ctx.msg.chat_id,

@@ -7,7 +7,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from loguru import logger
 
@@ -89,6 +89,7 @@ class SubagentManager:
         max_concurrent_subagents: int | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
         mailbox: MailboxStore | None = None,
+        on_result_ready: Callable[[TaskResult], Awaitable[None]] | None = None,
     ):
         defaults = AgentDefaults()
         self.provider = provider
@@ -111,7 +112,8 @@ class SubagentManager:
         )
         self.runner = AgentRunner(provider)
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
-        self.mailbox = mailbox or MailboxStore()
+        self.mailbox = mailbox or MailboxStore(workspace)
+        self._on_result_ready = on_result_ready
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._task_statuses: dict[str, SubagentStatus] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
@@ -332,7 +334,7 @@ class SubagentManager:
         if origin_message_id:
             metadata["origin_message_id"] = origin_message_id
 
-        written = await self.mailbox.record_result(TaskResult(
+        task_result = TaskResult(
             task_id=task_id,
             session_key=override,
             label=label,
@@ -341,7 +343,8 @@ class SubagentManager:
             content=result,
             dedupe_key=task_id,
             metadata=metadata,
-        ))
+        )
+        written = await self.mailbox.record_result(task_result)
 
         if written:
             logger.debug(
@@ -349,6 +352,11 @@ class SubagentManager:
                 task_id,
                 override,
             )
+            if self._on_result_ready is not None:
+                try:
+                    await self._on_result_ready(task_result)
+                except Exception:
+                    logger.exception("Subagent result-ready callback failed")
         else:
             logger.debug("Subagent [{}] result already recorded", task_id)
 
@@ -448,6 +456,41 @@ class SubagentManager:
             task_id=task_id,
             timeout_seconds=timeout_seconds,
         )
+
+    def runtime_status_lines(self, session_key: str, *, limit: int = 8) -> list[str]:
+        """Return compact model-visible task status lines for runtime context."""
+        snapshots = self.mailbox.snapshot_sync(session_key)
+        if not snapshots:
+            return []
+
+        now = time.time()
+        ordered = sorted(
+            snapshots,
+            key=lambda item: (
+                item.consumed_at is not None,
+                item.completed_at is None,
+                item.created_at,
+                item.task_id,
+            ),
+        )
+        lines = ["Subagent tasks:"]
+        for snapshot in ordered[: max(0, limit)]:
+            state = snapshot.state
+            if snapshot.result_status and snapshot.consumed_at is None:
+                state = f"{state}, result ready"
+            elif snapshot.consumed_at is not None:
+                state = f"{state}, result consumed"
+            elapsed = max(0, int((snapshot.completed_at or now) - snapshot.created_at))
+            label = " ".join(snapshot.label.split())
+            if len(label) > 48:
+                label = label[:45] + "..."
+            lines.append(
+                f"- {snapshot.task_id}: {state}, label=\"{label}\", elapsed={elapsed}s"
+            )
+        remaining = len(ordered) - limit
+        if remaining > 0:
+            lines.append(f"- ... {remaining} more subagent task(s)")
+        return lines
 
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
