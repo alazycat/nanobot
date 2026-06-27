@@ -52,3 +52,22 @@ def test_analyze_passing_test_records_success_without_feedback():
     assert analysis is not None
     assert analysis.status == "passed"
     assert append_verification_feedback("ok", analysis) == "ok"
+
+
+def test_analyze_command_not_found_as_failed_check():
+    output = """\
+STDERR:
+/usr/bin/bash: line 1: python3: command not found
+
+Exit code: 127
+"""
+
+    analysis = analyze_verification_result(
+        command="python3 - <<'PY'\nprint('quick verification')\nPY",
+        output=output,
+        exit_code=127,
+    )
+
+    assert analysis is not None
+    assert analysis.status == "failed"
+    assert any("command not found" in item for item in analysis.primary_errors)
