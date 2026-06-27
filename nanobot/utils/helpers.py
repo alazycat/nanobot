@@ -290,7 +290,8 @@ def current_time_str(timezone: str | None = None) -> str:
 
 
 _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
-_TOOL_RESULT_PREVIEW_CHARS = 1200
+_TOOL_RESULT_SUMMARY_MAX_EDGE_CHARS = 800
+_TOOL_RESULT_SUMMARY_MIN_EDGE_CHARS = 80
 _TOOL_RESULTS_DIR = ".nanobot/tool-results"
 _TOOL_RESULT_RETENTION_SECS = 7 * 24 * 60 * 60
 _TOOL_RESULT_MAX_BUCKETS = 32
@@ -408,18 +409,59 @@ def _render_tool_result_reference(
     filepath: Path,
     *,
     original_size: int,
-    preview: str,
-    truncated_preview: bool,
+    head: str,
+    tail: str | None,
+    omitted_middle_chars: int,
 ) -> str:
-    result = (
-        f"[tool output persisted]\n"
-        f"Full output saved to: {filepath}\n"
-        f"Original size: {original_size} chars\n"
-        f"Preview:\n{preview}"
+    lines = [
+        "[tool output persisted]",
+        f"tool_output_id: {filepath.stem}",
+        f"original_size_chars: {original_size}",
+        "storage: internal audit artifact",
+        (
+            "guidance: Use this head/tail summary first. Avoid reading "
+            "persisted tool-output files wholesale; rerun a narrower command "
+            "when more detail is needed."
+        ),
+        "head:",
+        head,
+    ]
+    if tail is not None:
+        lines.extend([
+            f"... omitted_middle_chars: {omitted_middle_chars}",
+            "tail:",
+            tail,
+        ])
+    return "\n".join(lines)
+
+
+def _build_tool_result_reference(filepath: Path, text: str, *, max_chars: int) -> str:
+    edge_chars = min(
+        _TOOL_RESULT_SUMMARY_MAX_EDGE_CHARS,
+        max(_TOOL_RESULT_SUMMARY_MIN_EDGE_CHARS, max_chars // 3),
     )
-    if truncated_preview:
-        result += "\n...\n(Read the saved file if you need the full output.)"
-    return result
+    while True:
+        head = text[:edge_chars]
+        if len(text) > edge_chars * 2:
+            tail: str | None = text[-edge_chars:]
+            omitted_middle_chars = len(text) - len(head) - len(tail)
+        else:
+            tail = None
+            omitted_middle_chars = 0
+        result = _render_tool_result_reference(
+            filepath,
+            original_size=len(text),
+            head=head,
+            tail=tail,
+            omitted_middle_chars=omitted_middle_chars,
+        )
+        if len(result) <= max_chars or edge_chars <= _TOOL_RESULT_SUMMARY_MIN_EDGE_CHARS:
+            return truncate_text(result, max_chars)
+        overflow = len(result) - max_chars
+        edge_chars = max(
+            _TOOL_RESULT_SUMMARY_MIN_EDGE_CHARS,
+            edge_chars - max(overflow // 2 + 1, 16),
+        )
 
 
 def _bucket_mtime(path: Path) -> float:
@@ -494,13 +536,7 @@ def maybe_persist_tool_result(
         else:
             _write_text_atomic(path, text_payload)
 
-    preview = text_payload[:_TOOL_RESULT_PREVIEW_CHARS]
-    return _render_tool_result_reference(
-        path,
-        original_size=len(text_payload),
-        preview=preview,
-        truncated_preview=len(text_payload) > _TOOL_RESULT_PREVIEW_CHARS,
-    )
+    return _build_tool_result_reference(path, text_payload, max_chars=max_chars)
 
 
 def split_message(content: str, max_len: int = 2000) -> list[str]:
