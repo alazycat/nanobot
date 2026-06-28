@@ -48,6 +48,7 @@ from nanobot.security.workspace_policy import is_path_within
 from nanobot.utils.helpers import build_structured_output_summary
 
 _IS_WINDOWS = sys.platform == "win32"
+_DETACHED_EXIT_GRACE_S = 1.0 if _IS_WINDOWS else 0.2
 
 
 # Policy note appended to recoverable workspace-boundary guard errors.
@@ -436,11 +437,7 @@ class ExecTool(Tool):
                 stdout=log_handle,
                 stderr=log_handle,
                 start_new_session=not _IS_WINDOWS,
-                creationflags=(
-                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-                    if _IS_WINDOWS
-                    else 0
-                ),
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if _IS_WINDOWS else 0,
             )
         except Exception as exc:
             return f"Error starting detached command: {exc}"
@@ -450,7 +447,7 @@ class ExecTool(Tool):
                     log_handle.close()
 
         try:
-            exit_code = await asyncio.wait_for(process.wait(), timeout=0.2)
+            exit_code = await asyncio.wait_for(process.wait(), timeout=_DETACHED_EXIT_GRACE_S)
         except asyncio.TimeoutError:
             return (
                 "Detached process started.\n"
