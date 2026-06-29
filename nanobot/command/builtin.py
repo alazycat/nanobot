@@ -82,10 +82,10 @@ BUILTIN_COMMAND_SPECS: tuple[BuiltinCommandSpec, ...] = (
     ),
     BuiltinCommandSpec(
         "/trigger",
-        "Create local trigger",
-        "Create a CLI trigger bound to this chat session.",
+        "Create named local trigger",
+        "Create a named CLI trigger bound to this chat session.",
         "zap",
-        "[name]",
+        "<name>",
     ),
     BuiltinCommandSpec(
         "/dream",
@@ -715,6 +715,18 @@ async def cmd_skill(ctx: CommandContext) -> OutboundMessage:
 
 async def cmd_trigger(ctx: CommandContext) -> OutboundMessage:
     """Create a local trigger bound to the current session."""
+    name = ctx.args.strip()
+    if not name:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content=(
+                "Usage: /trigger <name>\n\n"
+                "Create a named local trigger bound to this chat session."
+            ),
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+
     from nanobot.triggers.store import ExternalTriggerStore
 
     loop = ctx.loop
@@ -728,7 +740,6 @@ async def cmd_trigger(ctx: CommandContext) -> OutboundMessage:
     if store is None:
         store = ExternalTriggerStore(workspace)
 
-    name = ctx.args.strip() or "External trigger"
     trigger = store.create(
         name=name,
         channel=ctx.msg.channel,
