@@ -19,6 +19,7 @@ from nanobot.utils.helpers import (
     find_legal_message_start,
     maybe_persist_tool_result,
     truncate_text,
+    truncate_text_to_tokens,
 )
 from nanobot.utils.runtime import ensure_nonempty_tool_result
 
@@ -478,14 +479,13 @@ class ContextGovernor:
             if reduction <= 0:
                 continue
             content = updated[i]["content"]
-            # ~4 chars per token; keep at least 200 chars as a floor
-            target_chars = max(200, len(content) - reduction * 4)
-            updated[i]["content"] = truncate_text(content, target_chars)
+            target_tokens = max(1, msg_tokens - reduction)
+            updated[i]["content"] = truncate_text_to_tokens(content, target_tokens)
             logger.warning(
-                "Emergency tool result truncation for {}: {}→{} chars "
+                "Emergency tool result truncation for {}: {}→{}t "
                 "(budget {}t, overflow {}t, session {})",
                 updated[i].get("name", "?"),
-                len(content), target_chars,
+                msg_tokens, target_tokens,
                 budget, overflow,
                 config.session_key or "default",
             )
